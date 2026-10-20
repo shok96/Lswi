@@ -23,6 +23,18 @@ pub struct Settings {
     /// После замены текста активировать целевую раскладку в активном окне.
     #[serde(default = "default_false")]
     pub switch_layout_after: bool,
+    /// Слушать горячую клавишу голосового ввода.
+    #[serde(default = "default_true")]
+    pub voice_enabled: bool,
+    /// Клавиша голосового ввода (одинарное нажатие).
+    #[serde(default = "default_voice_hotkey")]
+    pub voice_hotkey_vk: u16,
+    /// Модификаторы голосового ввода: Ctrl/Shift/Alt/Win.
+    #[serde(default)]
+    pub voice_hotkey_mods: u16,
+    /// Имя устройства записи. Пустая строка — системный микрофон по умолчанию.
+    #[serde(default)]
+    pub microphone_id: String,
 }
 
 fn default_true() -> bool {
@@ -41,6 +53,10 @@ fn default_interval() -> u32 {
     400
 }
 
+fn default_voice_hotkey() -> u16 {
+    keys::VK_F1 + 7
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -49,6 +65,10 @@ impl Default for Settings {
             double_tap_ms: default_interval(),
             start_with_windows: true,
             switch_layout_after: false,
+            voice_enabled: true,
+            voice_hotkey_vk: default_voice_hotkey(),
+            voice_hotkey_mods: 0,
+            microphone_id: String::new(),
         }
     }
 }
@@ -89,6 +109,13 @@ impl Settings {
         if self.hotkey_vk == 0 {
             self.hotkey_vk = default_hotkey();
         }
+        if self.voice_hotkey_vk == 0 {
+            self.voice_hotkey_vk = default_voice_hotkey();
+        }
+        if let Some(flag) = keys::modifier_flag(self.voice_hotkey_vk) {
+            self.voice_hotkey_mods &= !flag;
+        }
+        self.voice_hotkey_mods &= keys::MOD_CTRL | keys::MOD_SHIFT | keys::MOD_ALT | keys::MOD_WIN;
     }
 }
 
@@ -106,6 +133,21 @@ mod tests {
         s.sanitize();
         assert_eq!(s.double_tap_ms, 150);
         assert_ne!(s.hotkey_vk, 0);
+    }
+
+    #[test]
+    fn voice_hotkey_defaults() {
+        let mut s = Settings {
+            voice_hotkey_vk: 0,
+            voice_hotkey_mods: 0xFFFF,
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_ne!(s.voice_hotkey_vk, 0);
+        assert_eq!(
+            s.voice_hotkey_mods & !(keys::MOD_CTRL | keys::MOD_SHIFT | keys::MOD_ALT | keys::MOD_WIN),
+            0
+        );
     }
 }
 

@@ -11,9 +11,9 @@ use windows::Win32::System::Memory::{
 use windows::Win32::UI::Controls::EM_GETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_C,
-    VK_CONTROL, VK_INSERT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
-    VK_V,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    VIRTUAL_KEY, VK_BACK, VK_C, VK_CONTROL, VK_INSERT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW, GetWindowTextW,
@@ -280,6 +280,52 @@ pub fn copy_selection() -> Option<String> {
 
     send_combo(VK_INSERT);
     wait_clipboard_text(before, 350)
+}
+
+pub fn backspace(count: usize) {
+    if count == 0 {
+        return;
+    }
+    let mut events = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        events.push((VK_BACK, false));
+        events.push((VK_BACK, true));
+    }
+    send_vk_batch(&events);
+}
+
+pub fn type_unicode(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut inputs: Vec<INPUT> = Vec::new();
+    for unit in text.encode_utf16() {
+        inputs.push(unicode_input(unit, false));
+        inputs.push(unicode_input(unit, true));
+    }
+    unsafe {
+        let _ = SendInput(&mut inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+fn unicode_input(unit: u16, up: bool) -> INPUT {
+    let flags = if up {
+        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+    } else {
+        KEYEVENTF_UNICODE
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 pub fn paste_text(text: &str) -> bool {

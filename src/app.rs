@@ -1,6 +1,6 @@
 use crate::settings::Settings;
 use crate::util::{hwnd_from_isize, hwnd_to_isize};
-use crate::{autostart, clipboard, keys, layout, tray, ui};
+use crate::{autostart, clipboard, keys, layout, overlay, tray, ui, voice};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::w;
@@ -22,6 +22,9 @@ pub const WM_CONVERT: u32 = WM_APP + 2;
 pub const WM_BEGIN_CAPTURE: u32 = WM_APP + 3;
 pub const WM_SAVE_SETTINGS: u32 = WM_APP + 4;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 6;
+pub const WM_BEGIN_VOICE_CAPTURE: u32 = WM_APP + 12;
+pub const WM_MIC_TEST: u32 = WM_APP + 13;
+pub const WM_VOICE_TOGGLE: u32 = WM_APP + 14;
 const IDM_SETTINGS: u32 = 1;
 const IDM_TOGGLE: u32 = 2;
 const IDM_EXIT: u32 = 3;
@@ -30,6 +33,7 @@ const TIMER_RESTORE: usize = 2;
 static HOST: AtomicIsize = AtomicIsize::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
+static CAPTURE_VOICE: AtomicBool = AtomicBool::new(false);
 static HOTKEY_VK: AtomicU16 = AtomicU16::new(0);
 static INTERVAL_MS: AtomicU32 = AtomicU32::new(400);
 static PENDING_TAP: AtomicBool = AtomicBool::new(false);
@@ -38,11 +42,17 @@ static CHORDED: AtomicBool = AtomicBool::new(false);
 static LAST_UP_MS: AtomicU64 = AtomicU64::new(0);
 static EAT_KEYUP: AtomicU16 = AtomicU16::new(0);
 static FIRE_ON_UP: AtomicBool = AtomicBool::new(false);
+static MODS_DOWN: AtomicU16 = AtomicU16::new(0);
+static CAPTURE_MODS: AtomicU16 = AtomicU16::new(0);
+static CAPTURE_NONMOD: AtomicBool = AtomicBool::new(false);
+static VOICE_HELD: AtomicBool = AtomicBool::new(false);
+static MIC_TESTING: AtomicBool = AtomicBool::new(false);
 
 struct Inner {
     settings: Settings,
     settings_hwnd: isize,
     pending_hotkey: Option<u16>,
+    pending_voice: Option<(u16, u16)>,
     clipboard_restore: Option<String>,
     icon: isize,
     hook: isize,
@@ -53,6 +63,10 @@ static INNER: Mutex<Option<Inner>> = Mutex::new(None);
 
 pub fn run() -> windows::core::Result<()> {
     unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
         let instance = GetModuleHandleW(None)?;
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -64,6 +78,7 @@ pub fn run() -> windows::core::Result<()> {
         };
         RegisterClassW(&wc);
         ui::register_class(instance.into());
+        overlay::register_class(instance.into());
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -81,11 +96,18 @@ pub fn run() -> windows::core::Result<()> {
         )?;
         let _ = ShowWindow(hwnd, SW_HIDE);
         HOST.store(hwnd_to_isize(hwnd), Ordering::SeqCst);
+        voice::set_host(hwnd);
 
         let (settings, first_run) = Settings::load();
         ENABLED.store(settings.enabled, Ordering::SeqCst);
         HOTKEY_VK.store(settings.hotkey_vk, Ordering::SeqCst);
         INTERVAL_MS.store(settings.double_tap_ms, Ordering::SeqCst);
+        voice::apply_settings(
+            settings.voice_enabled,
+            settings.voice_hotkey_vk,
+            settings.voice_hotkey_mods,
+            &settings.microphone_id,
+        );
         let _ = autostart::apply(settings.start_with_windows);
 
         let icon = tray::create_icon();
@@ -97,6 +119,7 @@ pub fn run() -> windows::core::Result<()> {
             settings,
             settings_hwnd: 0,
             pending_hotkey: None,
+            pending_voice: None,
             clipboard_restore: None,
             icon: icon.0 as isize,
             hook: hook.0 as isize,
@@ -154,29 +177,32 @@ unsafe extern "system" fn low_level_keyboard(code: i32, wparam: WPARAM, lparam: 
 }
 
 fn handle_key(vk: u16, is_up: bool) -> bool {
+    if let Some(flag) = keys::modifier_flag(vk) {
+        if is_up {
+            MODS_DOWN.fetch_and(!flag, Ordering::SeqCst);
+        } else {
+            MODS_DOWN.fetch_or(flag, Ordering::SeqCst);
+        }
+    }
+
     if EAT_KEYUP.load(Ordering::SeqCst) == vk && is_up {
         EAT_KEYUP.store(0, Ordering::SeqCst);
         return true;
     }
 
     if CAPTURING.load(Ordering::SeqCst) {
-        if is_up {
-            return false;
-        }
-        CAPTURING.store(false, Ordering::SeqCst);
-        if let Ok(mut guard) = INNER.lock() {
-            if let Some(inner) = guard.as_mut() {
-                inner.pending_hotkey = Some(vk);
-                if inner.settings_hwnd != 0 {
-                    ui::set_hotkey_name(hwnd_from_isize(inner.settings_hwnd), vk);
-                }
-            }
-        }
-        EAT_KEYUP.store(vk, Ordering::SeqCst);
+        return if CAPTURE_VOICE.load(Ordering::SeqCst) {
+            capture_voice_hotkey(vk, is_up)
+        } else {
+            capture_layout_hotkey(vk, is_up)
+        };
+    }
+
+    if handle_voice_hotkey(vk, is_up) {
         return true;
     }
 
-    if !ENABLED.load(Ordering::SeqCst) {
+    if !ENABLED.load(Ordering::SeqCst) || voice::is_active() {
         return false;
     }
 
@@ -221,6 +247,100 @@ fn handle_key(vk: u16, is_up: bool) -> bool {
     false
 }
 
+fn capture_layout_hotkey(vk: u16, is_up: bool) -> bool {
+    if is_up {
+        return false;
+    }
+    CAPTURING.store(false, Ordering::SeqCst);
+    if let Ok(mut guard) = INNER.lock() {
+        if let Some(inner) = guard.as_mut() {
+            inner.pending_hotkey = Some(vk);
+            if inner.settings_hwnd != 0 {
+                ui::set_hotkey_name(hwnd_from_isize(inner.settings_hwnd), vk);
+            }
+        }
+    }
+    EAT_KEYUP.store(vk, Ordering::SeqCst);
+    true
+}
+
+fn capture_voice_hotkey(vk: u16, is_up: bool) -> bool {
+    if let Some(flag) = keys::modifier_flag(vk) {
+        if is_up {
+            if CAPTURE_NONMOD.load(Ordering::SeqCst) {
+                return true;
+            }
+            let others = CAPTURE_MODS.load(Ordering::SeqCst) & !flag;
+            finish_voice_capture(vk, others);
+            EAT_KEYUP.store(vk, Ordering::SeqCst);
+            return true;
+        }
+        CAPTURE_MODS.fetch_or(flag, Ordering::SeqCst);
+        return true;
+    }
+    if is_up {
+        return true;
+    }
+    CAPTURE_NONMOD.store(true, Ordering::SeqCst);
+    finish_voice_capture(vk, CAPTURE_MODS.load(Ordering::SeqCst));
+    EAT_KEYUP.store(vk, Ordering::SeqCst);
+    true
+}
+
+fn finish_voice_capture(vk: u16, mods: u16) {
+    CAPTURING.store(false, Ordering::SeqCst);
+    CAPTURE_VOICE.store(false, Ordering::SeqCst);
+    CAPTURE_NONMOD.store(false, Ordering::SeqCst);
+    CAPTURE_MODS.store(0, Ordering::SeqCst);
+    if let Ok(mut guard) = INNER.lock() {
+        if let Some(inner) = guard.as_mut() {
+            inner.pending_voice = Some((vk, mods));
+            if inner.settings_hwnd != 0 {
+                ui::set_voice_hotkey_name(hwnd_from_isize(inner.settings_hwnd), vk, mods);
+            }
+        }
+    }
+}
+
+fn handle_voice_hotkey(vk: u16, is_up: bool) -> bool {
+    if voice::is_active() && vk == keys::VK_ESCAPE {
+        if is_up {
+            return EAT_KEYUP.load(Ordering::SeqCst) == vk;
+        }
+        voice::stop();
+        EAT_KEYUP.store(vk, Ordering::SeqCst);
+        return true;
+    }
+
+    let (hot_vk, hot_mods) = voice::hotkey();
+    let mut mods = MODS_DOWN.load(Ordering::SeqCst);
+    if let Some(flag) = keys::modifier_flag(vk) {
+        mods &= !flag;
+    }
+    if !keys::matches_combo(vk, mods, hot_vk, hot_mods) {
+        if is_up && keys::matches_hotkey(vk, hot_vk) {
+            VOICE_HELD.store(false, Ordering::SeqCst);
+        }
+        return false;
+    }
+
+    if is_up {
+        VOICE_HELD.store(false, Ordering::SeqCst);
+        return false;
+    }
+    if !voice::is_active() && !(ENABLED.load(Ordering::SeqCst) && voice::enabled()) {
+        return false;
+    }
+    if VOICE_HELD.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    unsafe {
+        let _ = PostMessageW(host(), WM_VOICE_TOGGLE, WPARAM(0), LPARAM(0));
+    }
+    EAT_KEYUP.store(vk, Ordering::SeqCst);
+    true
+}
+
 unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     static TASKBAR: AtomicU32 = AtomicU32::new(0);
     let taskbar = TASKBAR.load(Ordering::Relaxed);
@@ -247,13 +367,21 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
             LRESULT(0)
         }
-        WM_OPEN_SETTINGS | WM_BEGIN_CAPTURE => {
-            if msg == WM_BEGIN_CAPTURE {
+        WM_OPEN_SETTINGS | WM_BEGIN_CAPTURE | WM_BEGIN_VOICE_CAPTURE => {
+            if msg == WM_BEGIN_CAPTURE || msg == WM_BEGIN_VOICE_CAPTURE {
                 CAPTURING.store(true, Ordering::SeqCst);
+                CAPTURE_VOICE.store(msg == WM_BEGIN_VOICE_CAPTURE, Ordering::SeqCst);
+                CAPTURE_MODS.store(0, Ordering::SeqCst);
+                CAPTURE_NONMOD.store(false, Ordering::SeqCst);
                 if let Ok(mut guard) = INNER.lock() {
                     if let Some(inner) = guard.as_mut() {
                         if inner.settings_hwnd != 0 {
-                            ui::begin_capture(hwnd_from_isize(inner.settings_hwnd));
+                            let settings_hwnd = hwnd_from_isize(inner.settings_hwnd);
+                            if msg == WM_BEGIN_VOICE_CAPTURE {
+                                ui::begin_voice_capture(settings_hwnd);
+                            } else {
+                                ui::begin_capture(settings_hwnd);
+                            }
                         }
                     }
                 }
@@ -264,6 +392,15 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_SAVE_SETTINGS => {
             save_from_ui();
+            LRESULT(0)
+        }
+        WM_MIC_TEST => {
+            toggle_mic_test();
+            LRESULT(0)
+        }
+        WM_VOICE_TOGGLE => {
+            stop_mic_test_ui();
+            voice::toggle();
             LRESULT(0)
         }
         WM_CONVERT => {
@@ -285,17 +422,79 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             PostQuitMessage(0);
             LRESULT(0)
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => {
+            if msg == voice::WM_VOICE_SHOW {
+                let instance = GetModuleHandleW(None).unwrap_or_default();
+                overlay::show(instance.into());
+                return LRESULT(0);
+            }
+            if msg == voice::WM_VOICE_HIDE {
+                overlay::hide();
+                return LRESULT(0);
+            }
+            if msg == voice::WM_VOICE_REFRESH {
+                overlay::refresh();
+                return LRESULT(0);
+            }
+            if msg == voice::WM_MIC_LEVEL {
+                if let Ok(guard) = INNER.lock() {
+                    if let Some(inner) = guard.as_ref() {
+                        if inner.settings_hwnd != 0 {
+                            ui::set_mic_level(hwnd_from_isize(inner.settings_hwnd), wparam.0 as u32);
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
     }
 }
 
 fn open_settings(host: HWND) {
     CAPTURING.store(false, Ordering::SeqCst);
+    CAPTURE_VOICE.store(false, Ordering::SeqCst);
     let instance = unsafe { GetModuleHandleW(None).unwrap_or_default() };
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.as_mut() {
             inner.pending_hotkey = None;
+            inner.pending_voice = None;
             inner.settings_hwnd = hwnd_to_isize(ui::open(host, instance.into(), &inner.settings));
+        }
+    }
+}
+
+fn toggle_mic_test() {
+    if MIC_TESTING.load(Ordering::SeqCst) {
+        stop_mic_test_ui();
+        return;
+    }
+    let (hwnd, device) = match INNER.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(inner) if inner.settings_hwnd != 0 => {
+                let hwnd = hwnd_from_isize(inner.settings_hwnd);
+                (hwnd, ui::selected_microphone(hwnd))
+            }
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    MIC_TESTING.store(true, Ordering::SeqCst);
+    ui::set_mic_testing(hwnd, true);
+    voice::start_meter(&device);
+}
+
+fn stop_mic_test_ui() {
+    if !MIC_TESTING.swap(false, Ordering::SeqCst) {
+        voice::stop_meter();
+        return;
+    }
+    voice::stop_meter();
+    if let Ok(guard) = INNER.lock() {
+        if let Some(inner) = guard.as_ref() {
+            if inner.settings_hwnd != 0 {
+                ui::set_mic_testing(hwnd_from_isize(inner.settings_hwnd), false);
+            }
         }
     }
 }
@@ -312,22 +511,35 @@ fn save_from_ui() {
             if let Some(vk) = inner.pending_hotkey {
                 next.hotkey_vk = vk;
             }
+            if let Some((vk, mods)) = inner.pending_voice {
+                next.voice_hotkey_vk = vk;
+                next.voice_hotkey_mods = mods;
+            }
             if next.save().is_ok() {
                 let _ = autostart::apply(next.start_with_windows);
                 ENABLED.store(next.enabled, Ordering::SeqCst);
                 HOTKEY_VK.store(next.hotkey_vk, Ordering::SeqCst);
                 INTERVAL_MS.store(next.double_tap_ms, Ordering::SeqCst);
+                voice::apply_settings(
+                    next.voice_enabled,
+                    next.voice_hotkey_vk,
+                    next.voice_hotkey_mods,
+                    &next.microphone_id,
+                );
                 inner.settings = next;
                 close_hwnd = settings_hwnd;
                 inner.settings_hwnd = 0;
                 inner.pending_hotkey = None;
+                inner.pending_voice = None;
                 inner.first_run = false;
             }
         }
     }
     CAPTURING.store(false, Ordering::SeqCst);
+    CAPTURE_VOICE.store(false, Ordering::SeqCst);
     PENDING_TAP.store(false, Ordering::SeqCst);
     FIRE_ON_UP.store(false, Ordering::SeqCst);
+    stop_mic_test_ui();
     if !close_hwnd.is_invalid() {
         unsafe {
             let _ = DestroyWindow(close_hwnd);
@@ -444,6 +656,10 @@ fn shutdown() {
     PENDING_TAP.store(false, Ordering::SeqCst);
     FIRE_ON_UP.store(false, Ordering::SeqCst);
     CAPTURING.store(false, Ordering::SeqCst);
+    CAPTURE_VOICE.store(false, Ordering::SeqCst);
+    voice::stop();
+    voice::stop_meter();
+    overlay::destroy();
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.take() {
             unsafe {

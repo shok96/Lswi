@@ -76,6 +76,25 @@ fn alt_family(vk: u16) -> bool {
     matches!(vk, VK_MENU | VK_LMENU | VK_RMENU)
 }
 
+pub const MOD_CTRL: u16 = 0x01;
+pub const MOD_SHIFT: u16 = 0x02;
+pub const MOD_ALT: u16 = 0x04;
+pub const MOD_WIN: u16 = 0x08;
+
+pub fn modifier_flag(vk: u16) -> Option<u16> {
+    if ctrl_family(vk) {
+        Some(MOD_CTRL)
+    } else if shift_family(vk) {
+        Some(MOD_SHIFT)
+    } else if alt_family(vk) {
+        Some(MOD_ALT)
+    } else if vk == VK_LWIN || vk == VK_RWIN {
+        Some(MOD_WIN)
+    } else {
+        None
+    }
+}
+
 /// Левый и правый Shift/Ctrl/Alt считаются одной клавишей.
 pub fn matches_hotkey(pressed: u16, configured: u16) -> bool {
     if pressed == 0 || configured == 0 {
@@ -87,6 +106,28 @@ pub fn matches_hotkey(pressed: u16, configured: u16) -> bool {
     (shift_family(pressed) && shift_family(configured))
         || (ctrl_family(pressed) && ctrl_family(configured))
         || (alt_family(pressed) && alt_family(configured))
+}
+
+pub fn matches_combo(pressed: u16, pressed_mods: u16, configured: u16, configured_mods: u16) -> bool {
+    matches_hotkey(pressed, configured) && pressed_mods == configured_mods
+}
+
+pub fn combo_name(vk: u16, mods: u16) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if mods & MOD_CTRL != 0 {
+        parts.push("Ctrl".into());
+    }
+    if mods & MOD_SHIFT != 0 {
+        parts.push("Shift".into());
+    }
+    if mods & MOD_ALT != 0 {
+        parts.push("Alt".into());
+    }
+    if mods & MOD_WIN != 0 {
+        parts.push("Win".into());
+    }
+    parts.push(display_name(vk));
+    parts.join(" + ")
 }
 
 pub fn display_name(vk: u16) -> String {
@@ -163,5 +204,10 @@ mod tests {
         assert!(matches_hotkey(VK_LSHIFT, VK_RSHIFT));
         assert!(matches_hotkey(VK_SHIFT, VK_LSHIFT));
         assert!(!matches_hotkey(VK_LSHIFT, VK_PAUSE));
+        assert_eq!(combo_name(VK_SPACE, MOD_CTRL | MOD_SHIFT), "Ctrl + Shift + Space");
+        assert_eq!(combo_name(VK_PAUSE, 0), "Pause");
+        assert!(matches_combo(0x41, MOD_CTRL, 0x41, MOD_CTRL));
+        assert!(!matches_combo(0x41, MOD_CTRL, 0x41, 0));
+        assert_eq!(modifier_flag(VK_LCONTROL), Some(MOD_CTRL));
     }
 }

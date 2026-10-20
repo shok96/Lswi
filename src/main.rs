@@ -10,11 +10,15 @@ mod app;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod util;
+#[cfg(windows)]
+mod voice;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod unix;
