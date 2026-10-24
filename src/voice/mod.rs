@@ -385,21 +385,17 @@ fn post(msg: u32, wparam: usize, lparam: isize) {
 }
 
 struct Injector {
-    spoken: String,
     typed: String,
     tail: String,
     last_raw: String,
-    started: bool,
 }
 
 impl Injector {
     fn new() -> Self {
         Self {
-            spoken: String::new(),
             typed: String::new(),
             tail: String::new(),
             last_raw: String::new(),
-            started: false,
         }
     }
 
@@ -433,93 +429,64 @@ impl Injector {
             self.tail.clear();
         }
         let expanded = apply_commands(&piece);
-        if !self.spoken.is_empty() && !self.spoken.ends_with([' ', '\n']) {
-            self.spoken.push(' ');
-        }
-        self.spoken.push_str(&expanded);
         self.last_raw = piece;
-        let next = if POLISH.load(Ordering::SeqCst) && crate::smart::model_ready() {
-            let mut polished = punctuate_stream(&self.spoken);
-            if !polished.ends_with(' ') && !polished.ends_with('\n') {
-                polished.push(' ');
-            }
-            polished
-        } else {
-            let mut plain = expanded;
-            if !self.started {
-                plain = capitalize(&plain);
-            }
-            if !plain.ends_with(' ') && !plain.ends_with('\n') {
-                plain.push(' ');
-            }
-            if self.typed.is_empty() {
-                plain
-            } else {
-                let mut combined = self.typed.clone();
-                if !combined.ends_with([' ', '\n']) {
-                    combined.push(' ');
-                }
-                combined.push_str(plain.trim_start());
-                combined
-            }
-        };
-        self.started = true;
-        sync(&self.typed, &next);
-        self.typed = next;
-        set_ui("Говорите…", self.typed.trim(), false);
+        let mut phrase = punctuate_phrase(&expanded);
+        if self.typed.is_empty() || ends_sentence(&self.typed) {
+            phrase = capitalize(&phrase);
+        }
+        if !phrase.ends_with(' ') && !phrase.ends_with('\n') {
+            phrase.push(' ');
+        }
+        clipboard::type_unicode(&phrase);
+        self.typed.push_str(&phrase);
+        set_ui("Говорите…", phrase.trim(), false);
         post(WM_VOICE_REFRESH, 0, 0);
     }
 
     fn finish(&mut self) {
-        if !self.tail.is_empty() {
-            sync(&self.tail, "");
-            self.tail.clear();
-        }
-        if !POLISH.load(Ordering::SeqCst) {
+        if self.tail.is_empty() {
             return;
         }
-        let raw = self.spoken.trim().to_string();
-        if raw.is_empty() {
-            return;
-        }
-        if !crate::smart::model_ready() {
-            set_ui("Загружаю модель знаков…", "", false);
-            post(WM_VOICE_REFRESH, 0, 0);
-            let _ = crate::smart::ensure_model(&mut |msg| {
-                set_ui(msg, "", false);
-                post(WM_VOICE_REFRESH, 0, 0);
-            });
-        }
-        let polished = punctuate_stream(&raw);
-        if polished.trim() == self.typed.trim() {
-            return;
-        }
-        sync(&self.typed, &polished);
-        self.typed = polished;
-        set_ui("Готово", self.typed.trim(), false);
-        post(WM_VOICE_REFRESH, 0, 0);
-        std::thread::sleep(Duration::from_millis(400));
+        let pending = self.tail.clone();
+        self.last_raw.clear();
+        self.commit(&pending);
     }
 }
 
-fn punctuate_stream(raw: &str) -> String {
-    let words: Vec<&str> = raw.split_whitespace().collect();
-    if words.is_empty() {
-        return String::new();
+fn punctuate_phrase(raw: &str) -> String {
+    if raw.is_empty() || !POLISH.load(Ordering::SeqCst) || !crate::smart::model_ready() {
+        return raw.to_string();
     }
-    const WINDOW: usize = 60;
-    if words.len() <= WINDOW {
-        return crate::smart::polish_voice_ex(&words.join(" "), true);
+    let polished = crate::smart::polish_voice_ex(raw, true);
+    if same_words(raw, &polished) {
+        polished
+    } else {
+        raw.to_string()
     }
-    let mut out = String::new();
-    for chunk in words.chunks(WINDOW) {
-        let part = crate::smart::polish_voice_ex(&chunk.join(" "), true);
-        if !out.is_empty() && !out.ends_with(' ') {
-            out.push(' ');
-        }
-        out.push_str(part.trim());
-    }
-    out
+}
+
+fn same_words(original: &str, polished: &str) -> bool {
+    word_keys(original) == word_keys(polished)
+}
+
+fn word_keys(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let key: String = word
+                .chars()
+                .filter(|ch| ch.is_alphabetic() || *ch == '-')
+                .flat_map(|ch| ch.to_lowercase())
+                .collect();
+            if key.is_empty() { None } else { Some(key) }
+        })
+        .collect()
+}
+
+fn ends_sentence(text: &str) -> bool {
+    text.chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | '…'))
 }
 
 fn apply_commands(text: &str) -> String {
@@ -546,6 +513,20 @@ fn capitalize(text: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_words;
+
+    #[test]
+    fn punctuation_may_not_replace_words() {
+        assert!(same_words(
+            "привет меня зовут роман",
+            "Привет, меня зовут Роман."
+        ));
+        assert!(!same_words("привет меня зовут роман", "Привет, Роман!"));
     }
 }
 

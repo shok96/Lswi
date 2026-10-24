@@ -6,6 +6,8 @@ It runs on **Windows**, **macOS**, and **Linux**. Layout correction is on every 
 
 Closing the settings window does not exit the process. The tray item **Выход** does. A second launch on Windows finds the running process, brings it forward, and opens **Настройки**. A second launch on macOS or Linux prints `LSWI уже запущена` and exits.
 
+![Windows settings](docs/settings.png)
+
 ## How to use
 
 1. Select text that was typed in the wrong layout.
@@ -109,7 +111,7 @@ The lock file on macOS and Linux is `$XDG_RUNTIME_DIR/Lswi/lswi.lock`, or the co
 | `microphone_id` | `""` | Capture device id. Empty is the system default |
 | `voice_polish` | `true` | Punctuate and fix case after a voice session |
 
-On Windows the tray left click and **Настройки** open the window. The first launch with no settings file opens it immediately. **Назначить** waits for the next key-down and stores that virtual-key code. The voice assign button stores a key plus the modifiers held with it. macOS and Linux assign a single key from the tray item **Назначить клавишу**, and the double-tap gap is one of 250, 400, 600, 800, or 1000 ms.
+On Windows the tray left click and **Настройки** open the window shown above. The first launch with no settings file opens it immediately. Click **Горячая клавиша** or **Клавиша голоса** to capture the next key-down; voice capture also stores modifiers held with the key. Changes apply as soon as a row is toggled or a key is assigned. macOS and Linux assign a single key from the tray item **Назначить клавишу**, and the double-tap gap is one of 250, 400, 600, 800, or 1000 ms.
 
 Start at login stores the current executable path. On Windows the `Run` value is the quoted path. On macOS the LaunchAgent label is `com.lswi.app` and it is bootstrapped into `gui/<uid>`. On Linux the autostart entry is `lswi.desktop` with `Terminal=false`.
 

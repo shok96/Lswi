@@ -1,6 +1,6 @@
 [package]
 name = "lswi"
-version = "0.1.5"
+version = "0.0.1"
 edition = "2021"
 description = "Смена раскладки выделенного текста по двойному нажатию горячей клавиши"
 authors = ["LSWI"]
@@ -21,6 +21,7 @@ windows = { version = "0.58", features = [
     "implement",
     "Win32_Devices_Properties",
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Networking_WinInet",

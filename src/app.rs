@@ -26,6 +26,7 @@ pub const WM_BEGIN_VOICE_CAPTURE: u32 = WM_APP + 12;
 pub const WM_MIC_TEST: u32 = WM_APP + 13;
 pub const WM_VOICE_TOGGLE: u32 = WM_APP + 14;
 const WM_SCHEDULE_RESTORE: u32 = WM_APP + 15;
+pub const WM_SETTINGS_CLOSED: u32 = WM_APP + 16;
 const IDM_SETTINGS: u32 = 1;
 const IDM_TOGGLE: u32 = 2;
 const IDM_EXIT: u32 = 3;
@@ -257,15 +258,20 @@ fn capture_layout_hotkey(vk: u16, is_up: bool) -> bool {
         return false;
     }
     CAPTURING.store(false, Ordering::SeqCst);
+    let mut apply = false;
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.as_mut() {
             inner.pending_hotkey = Some(vk);
             if inner.settings_hwnd != 0 {
                 ui::set_hotkey_name(hwnd_from_isize(inner.settings_hwnd), vk);
+                apply = true;
             }
         }
     }
     EAT_KEYUP.store(vk, Ordering::SeqCst);
+    if apply {
+        save_from_ui();
+    }
     true
 }
 
@@ -297,13 +303,18 @@ fn finish_voice_capture(vk: u16, mods: u16) {
     CAPTURE_VOICE.store(false, Ordering::SeqCst);
     CAPTURE_NONMOD.store(false, Ordering::SeqCst);
     CAPTURE_MODS.store(0, Ordering::SeqCst);
+    let mut apply = false;
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.as_mut() {
             inner.pending_voice = Some((vk, mods));
             if inner.settings_hwnd != 0 {
                 ui::set_voice_hotkey_name(hwnd_from_isize(inner.settings_hwnd), vk, mods);
+                apply = true;
             }
         }
+    }
+    if apply {
+        save_from_ui();
     }
 }
 
@@ -397,6 +408,19 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_SAVE_SETTINGS => {
             save_from_ui();
+            LRESULT(0)
+        }
+        WM_SETTINGS_CLOSED => {
+            if let Ok(mut guard) = INNER.lock() {
+                if let Some(inner) = guard.as_mut() {
+                    inner.settings_hwnd = 0;
+                    inner.pending_hotkey = None;
+                    inner.pending_voice = None;
+                }
+            }
+            CAPTURING.store(false, Ordering::SeqCst);
+            CAPTURE_VOICE.store(false, Ordering::SeqCst);
+            stop_mic_test_ui();
             LRESULT(0)
         }
         WM_MIC_TEST => {
@@ -518,7 +542,6 @@ fn stop_mic_test_ui() {
 }
 
 fn save_from_ui() {
-    let mut close_hwnd = HWND::default();
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.as_mut() {
             if inner.settings_hwnd == 0 {
@@ -526,10 +549,10 @@ fn save_from_ui() {
             }
             let settings_hwnd = hwnd_from_isize(inner.settings_hwnd);
             let mut next = ui::collect(settings_hwnd, &inner.settings);
-            if let Some(vk) = inner.pending_hotkey {
+            if let Some(vk) = inner.pending_hotkey.take() {
                 next.hotkey_vk = vk;
             }
-            if let Some((vk, mods)) = inner.pending_voice {
+            if let Some((vk, mods)) = inner.pending_voice.take() {
                 next.voice_hotkey_vk = vk;
                 next.voice_hotkey_mods = mods;
             }
@@ -546,24 +569,12 @@ fn save_from_ui() {
                     next.voice_polish,
                 );
                 inner.settings = next;
-                close_hwnd = settings_hwnd;
-                inner.settings_hwnd = 0;
-                inner.pending_hotkey = None;
-                inner.pending_voice = None;
                 inner.first_run = false;
             }
         }
     }
-    CAPTURING.store(false, Ordering::SeqCst);
-    CAPTURE_VOICE.store(false, Ordering::SeqCst);
     PENDING_TAP.store(false, Ordering::SeqCst);
     FIRE_ON_UP.store(false, Ordering::SeqCst);
-    stop_mic_test_ui();
-    if !close_hwnd.is_invalid() {
-        unsafe {
-            let _ = DestroyWindow(close_hwnd);
-        }
-    }
 }
 
 fn show_menu(hwnd: HWND) {
@@ -608,6 +619,9 @@ fn toggle_enabled() {
             inner.settings.enabled = !inner.settings.enabled;
             ENABLED.store(inner.settings.enabled, Ordering::SeqCst);
             let _ = inner.settings.save();
+            if inner.settings_hwnd != 0 {
+                ui::fill(hwnd_from_isize(inner.settings_hwnd), &inner.settings);
+            }
         }
     }
 }

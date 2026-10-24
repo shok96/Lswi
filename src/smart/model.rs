@@ -263,8 +263,7 @@ fn apply_label(word: &str, label: &str) -> String {
         (case, mark)
     };
     let body = match case {
-        "UPPER" => capitalize(word),
-        "TOTAL" => word.to_uppercase(),
+        "UPPER" | "TOTAL" => capitalize(word),
         _ => word.to_string(),
     };
     match mark {
