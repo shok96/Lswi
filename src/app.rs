@@ -25,10 +25,12 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 6;
 pub const WM_BEGIN_VOICE_CAPTURE: u32 = WM_APP + 12;
 pub const WM_MIC_TEST: u32 = WM_APP + 13;
 pub const WM_VOICE_TOGGLE: u32 = WM_APP + 14;
+const WM_SCHEDULE_RESTORE: u32 = WM_APP + 15;
 const IDM_SETTINGS: u32 = 1;
 const IDM_TOGGLE: u32 = 2;
 const IDM_EXIT: u32 = 3;
 const TIMER_RESTORE: usize = 2;
+const TIMER_MIC: usize = 3;
 
 static HOST: AtomicIsize = AtomicIsize::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -47,6 +49,7 @@ static CAPTURE_MODS: AtomicU16 = AtomicU16::new(0);
 static CAPTURE_NONMOD: AtomicBool = AtomicBool::new(false);
 static VOICE_HELD: AtomicBool = AtomicBool::new(false);
 static MIC_TESTING: AtomicBool = AtomicBool::new(false);
+static CONVERTING: AtomicBool = AtomicBool::new(false);
 
 struct Inner {
     settings: Settings,
@@ -97,6 +100,7 @@ pub fn run() -> windows::core::Result<()> {
         let _ = ShowWindow(hwnd, SW_HIDE);
         HOST.store(hwnd_to_isize(hwnd), Ordering::SeqCst);
         voice::set_host(hwnd);
+        voice::start_watch();
 
         let (settings, first_run) = Settings::load();
         ENABLED.store(settings.enabled, Ordering::SeqCst);
@@ -107,6 +111,7 @@ pub fn run() -> windows::core::Result<()> {
             settings.voice_hotkey_vk,
             settings.voice_hotkey_mods,
             &settings.microphone_id,
+            settings.voice_polish,
         );
         let _ = autostart::apply(settings.start_with_windows);
 
@@ -404,16 +409,25 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             LRESULT(0)
         }
         WM_CONVERT => {
+            let _ = KillTimer(hwnd, TIMER_RESTORE);
+            restore_clipboard();
             std::thread::spawn(|| {
                 clipboard::wait_modifiers_up();
                 convert_now();
             });
             LRESULT(0)
         }
+        WM_SCHEDULE_RESTORE => {
+            let _ = SetTimer(hwnd, TIMER_RESTORE, 800, None);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_RESTORE {
                 let _ = KillTimer(hwnd, TIMER_RESTORE);
                 restore_clipboard();
+            } else if wparam.0 == TIMER_MIC {
+                let _ = KillTimer(hwnd, TIMER_MIC);
+                sync_microphones();
             }
             LRESULT(0)
         }
@@ -444,6 +458,10 @@ unsafe extern "system" fn host_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                         }
                     }
                 }
+                return LRESULT(0);
+            }
+            if msg == voice::WM_MIC_DEVICES {
+                let _ = SetTimer(hwnd, TIMER_MIC, 250, None);
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -525,6 +543,7 @@ fn save_from_ui() {
                     next.voice_hotkey_vk,
                     next.voice_hotkey_mods,
                     &next.microphone_id,
+                    next.voice_polish,
                 );
                 inner.settings = next;
                 close_hwnd = settings_hwnd;
@@ -612,30 +631,70 @@ fn restore_clipboard() {
 }
 
 fn convert_now() {
+    if CONVERTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            CONVERTING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _done = Done;
+
     if !ENABLED.load(Ordering::SeqCst) {
         return;
     }
-    let switch_after = INNER
+    let (switch_after, smart) = INNER
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().map(|i| i.settings.switch_layout_after))
-        .unwrap_or(false);
+        .and_then(|g| {
+            g.as_ref()
+                .map(|i| (i.settings.switch_layout_after, i.settings.smart_layout))
+        })
+        .unwrap_or((false, true));
 
     let layouts = layout::installed_layouts();
     let saved = clipboard::read_unicode();
     let Some(text) = clipboard::copy_selection() else {
+        clipboard::restore(saved.as_deref());
         balloon("Не удалось прочитать выделенный текст. Выделите текст и повторите.");
         return;
     };
     if text.len() > 50_000 {
+        clipboard::restore(saved.as_deref());
         return;
     }
     let current = layout::foreground_layout();
-    let Some((converted, target)) = layout::convert_selection(&text, current, &layouts) else {
-        balloon("Не получилось сменить раскладку этого текста.");
-        return;
+    let (converted, target) = if smart && crate::smart::dict_ready() {
+        match crate::smart::convert_outcome(&text) {
+            crate::smart::SmartOutcome::Converted(converted) => {
+                let target = layout::layout_for_text(&converted, current, &layouts);
+                (converted, target)
+            }
+            crate::smart::SmartOutcome::Unchanged => {
+                clipboard::restore(saved.as_deref());
+                balloon("Текст уже в правильной раскладке.");
+                return;
+            }
+            crate::smart::SmartOutcome::Uncertain => {
+                clipboard::restore(saved.as_deref());
+                balloon("Не получилось сменить раскладку этого текста.");
+                return;
+            }
+        }
+    } else {
+        match layout::convert_selection(&text, current, &layouts) {
+            Some(pair) => pair,
+            None => {
+                clipboard::restore(saved.as_deref());
+                balloon("Не получилось сменить раскладку этого текста.");
+                return;
+            }
+        }
     };
-    if !clipboard::paste_text(&converted) {
+    if converted.is_empty() || !clipboard::paste_text(&converted) {
+        clipboard::restore(saved.as_deref());
         balloon("Не удалось вставить преобразованный текст.");
         return;
     }
@@ -645,10 +704,96 @@ fn convert_now() {
         }
     }
     unsafe {
-        let _ = SetTimer(host(), TIMER_RESTORE, 500, None);
+        let _ = PostMessageW(host(), WM_SCHEDULE_RESTORE, WPARAM(0), LPARAM(0));
     }
     if switch_after && layouts.len() >= 2 {
         layout::activate_layout(target);
+    }
+}
+
+fn sync_microphones() {
+    let devices = voice::list_microphones();
+    let ids: Vec<&str> = devices.iter().map(|mic| mic.id.as_str()).collect();
+
+    let mut persist: Option<String> = None;
+    let mut settings_hwnd = HWND::default();
+    let mut combo_keep = String::new();
+    let mut using_default = false;
+
+    if let Ok(mut guard) = INNER.lock() {
+        if let Some(inner) = guard.as_mut() {
+            let saved = inner.settings.microphone_id.clone();
+            let saved_gone = !saved.is_empty() && !ids.iter().any(|id| *id == saved);
+            using_default = saved.is_empty() || saved_gone;
+
+            if inner.settings_hwnd != 0 {
+                settings_hwnd = hwnd_from_isize(inner.settings_hwnd);
+                let ui_id = ui::selected_microphone(settings_hwnd);
+                combo_keep = if ui_id.is_empty() || ids.iter().any(|id| *id == ui_id) {
+                    ui_id
+                } else if !saved_gone && ids.iter().any(|id| *id == saved) {
+                    saved.clone()
+                } else {
+                    String::new()
+                };
+            }
+
+            if saved_gone {
+                let next = if !combo_keep.is_empty() && ids.iter().any(|id| *id == combo_keep) {
+                    combo_keep.clone()
+                } else {
+                    String::new()
+                };
+                inner.settings.microphone_id = next.clone();
+                persist = Some(next);
+            }
+        }
+    }
+
+    if !settings_hwnd.is_invalid() {
+        ui::refresh_microphones(settings_hwnd, &combo_keep);
+    }
+
+    if let Some(next) = persist.clone() {
+        if let Ok(guard) = INNER.lock() {
+            if let Some(inner) = guard.as_ref() {
+                let _ = inner.settings.save();
+                voice::apply_settings(
+                    inner.settings.voice_enabled,
+                    inner.settings.voice_hotkey_vk,
+                    inner.settings.voice_hotkey_mods,
+                    &next,
+                    inner.settings.voice_polish,
+                );
+            }
+        }
+        if voice::is_active() {
+            voice::stop();
+        }
+        balloon("Микрофон отключён");
+    }
+
+    let default_changed = voice::default_capture_changed();
+    if using_default && default_changed && persist.is_none() && voice::is_active() {
+        voice::stop();
+    }
+
+    if MIC_TESTING.load(Ordering::SeqCst) {
+        let restart = persist.is_some()
+            || (using_default && default_changed)
+            || !voice::meter_running();
+        if restart {
+            let id = if !settings_hwnd.is_invalid() {
+                ui::selected_microphone(settings_hwnd)
+            } else {
+                voice::selected_device()
+            };
+            if devices.is_empty() {
+                stop_mic_test_ui();
+            } else {
+                voice::start_meter(&id);
+            }
+        }
     }
 }
 
@@ -659,6 +804,7 @@ fn shutdown() {
     CAPTURE_VOICE.store(false, Ordering::SeqCst);
     voice::stop();
     voice::stop_meter();
+    voice::stop_watch();
     overlay::destroy();
     if let Ok(mut guard) = INNER.lock() {
         if let Some(inner) = guard.take() {

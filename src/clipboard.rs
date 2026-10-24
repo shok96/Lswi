@@ -16,9 +16,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW, GetWindowTextW,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, SendMessageTimeoutW, SendMessageW, GUITHREADINFO, SMTO_ABORTIFHUNG,
-    WM_COPY, WM_PASTE,
+    WM_COPY,
 };
 
 const CF_UNICODETEXT: u32 = 13;
@@ -118,8 +118,18 @@ fn focused_control() -> HWND {
     }
 }
 
+fn is_native_edit(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    if n == 0 {
+        return false;
+    }
+    let class = String::from_utf16_lossy(&buf[..n]).to_ascii_lowercase();
+    class == "edit" || class.contains("richedit")
+}
+
 fn read_edit_selection(hwnd: HWND) -> Option<String> {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || !is_native_edit(hwnd) {
         return None;
     }
     let mut start: u32 = 0;
@@ -237,22 +247,23 @@ fn send_combo(vk: VIRTUAL_KEY) {
     ]);
 }
 
-fn post_copy_or_paste(hwnd: HWND, paste: bool) {
+fn post_copy(hwnd: HWND) {
     if hwnd.is_invalid() {
         return;
     }
-    let msg = if paste { WM_PASTE } else { WM_COPY };
     unsafe {
-        let _ = SendMessageTimeoutW(hwnd, msg, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, None);
+        let _ = SendMessageTimeoutW(hwnd, WM_COPY, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, None);
     }
 }
 
-fn wait_clipboard_text(before: u32, ms: u64) -> Option<String> {
+fn wait_clipboard_text(before: u32, ms: u64, reject: Option<&str>) -> Option<String> {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         if unsafe { GetClipboardSequenceNumber() } != before {
             if let Some(text) = read_unicode() {
-                return Some(text);
+                if reject.map(|s| text != s).unwrap_or(true) {
+                    return Some(text);
+                }
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -266,20 +277,23 @@ pub fn copy_selection() -> Option<String> {
         return Some(text);
     }
 
-    clear_clipboard();
+    let sentinel = format!("\u{2060}lswi-{}\u{2060}", std::process::id());
+    if !write_unicode(&sentinel) {
+        return None;
+    }
     let before = unsafe { GetClipboardSequenceNumber() };
-    post_copy_or_paste(hwnd, false);
-    if let Some(text) = wait_clipboard_text(before, 200) {
+    post_copy(hwnd);
+    if let Some(text) = wait_clipboard_text(before, 220, Some(&sentinel)) {
         return Some(text);
     }
 
     send_combo(VK_C);
-    if let Some(text) = wait_clipboard_text(before, 350) {
+    if let Some(text) = wait_clipboard_text(before, 400, Some(&sentinel)) {
         return Some(text);
     }
 
     send_combo(VK_INSERT);
-    wait_clipboard_text(before, 350)
+    wait_clipboard_text(before, 350, Some(&sentinel))
 }
 
 pub fn backspace(count: usize) {
@@ -329,12 +343,20 @@ fn unicode_input(unit: u16, up: bool) -> INPUT {
 }
 
 pub fn paste_text(text: &str) -> bool {
-    if !write_unicode(text) {
+    if text.is_empty() || !write_unicode(text) {
         return false;
     }
-    let hwnd = focused_control();
-    thread::sleep(Duration::from_millis(30));
-    post_copy_or_paste(hwnd, true);
+    thread::sleep(Duration::from_millis(40));
     send_combo(VK_V);
+    thread::sleep(Duration::from_millis(120));
     true
+}
+
+pub fn restore(saved: Option<&str>) {
+    match saved {
+        Some(text) => {
+            let _ = write_unicode(text);
+        }
+        None => clear_clipboard(),
+    }
 }

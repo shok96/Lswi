@@ -37,10 +37,12 @@ pub const IDC_VOICE_ASSIGN: i32 = 111;
 pub const IDC_MIC: i32 = 112;
 pub const IDC_MIC_TEST: i32 = 113;
 pub const IDC_MIC_LEVEL: i32 = 114;
+pub const IDC_SMART: i32 = 115;
+pub const IDC_VOICE_POLISH: i32 = 116;
 
 const CLASS: PCWSTR = w!("LswiSettings");
 const WINDOW_W: i32 = 500;
-const WINDOW_H: i32 = 620;
+const WINDOW_H: i32 = 750;
 const SS_ETCHEDHORZ: i32 = 0x0010;
 const CB_SETMINVISIBLE: u32 = 0x1701;
 
@@ -48,10 +50,12 @@ struct Handles {
     enabled: HWND,
     autostart: HWND,
     switch_layout: HWND,
+    smart_layout: HWND,
     hotkey: HWND,
     assign: HWND,
     interval: HWND,
     voice_enabled: HWND,
+    voice_polish: HWND,
     voice_hotkey: HWND,
     voice_assign: HWND,
     mic: HWND,
@@ -96,11 +100,12 @@ pub fn open(
             return existing;
         }
     }
+    let title = wide(&format!("LSWI — настройки  v{}", crate::VERSION));
     unsafe {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS,
-            w!("LSWI — настройки"),
+            PCWSTR(title.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -176,6 +181,30 @@ fn create_controls(
         24,
         "Менять раскладку клавиатуры после замены текста",
     );
+    let smart_layout = child(
+        hwnd,
+        instance,
+        w!("BUTTON"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+        IDC_SMART,
+        20,
+        152,
+        440,
+        24,
+        "Умная конвертация по словам",
+    );
+    let smart_hint = child(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        WS_CHILD | WS_VISIBLE,
+        208,
+        40,
+        176,
+        420,
+        18,
+        "Выключите, чтобы всегда менять весь выделенный текст.",
+    );
     let hotkey_label = child(
         hwnd,
         instance,
@@ -183,7 +212,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE,
         201,
         20,
-        160,
+        210,
         440,
         20,
         "Горячая клавиша (два нажатия):",
@@ -195,7 +224,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_READONLY as u32),
         IDC_HOTKEY,
         20,
-        184,
+        234,
         280,
         26,
         &keys::display_name(settings.hotkey_vk),
@@ -207,7 +236,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         IDC_ASSIGN,
         310,
-        182,
+        232,
         140,
         28,
         "Назначить",
@@ -219,7 +248,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE,
         202,
         20,
-        220,
+        270,
         280,
         20,
         "Интервал двойного нажатия, мс:",
@@ -231,7 +260,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_NUMBER as u32),
         IDC_INTERVAL,
         310,
-        216,
+        266,
         140,
         26,
         &settings.double_tap_ms.to_string(),
@@ -243,7 +272,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_ETCHEDHORZ as u32),
         203,
         20,
-        256,
+        306,
         440,
         2,
         "",
@@ -255,7 +284,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE,
         204,
         20,
-        268,
+        318,
         440,
         20,
         "Голосовой ввод (русский)",
@@ -267,10 +296,34 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
         IDC_VOICE_ENABLED,
         20,
-        292,
+        342,
         440,
         24,
         "Включить голосовой ввод",
+    );
+    let voice_polish = child(
+        hwnd,
+        instance,
+        w!("BUTTON"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+        IDC_VOICE_POLISH,
+        20,
+        370,
+        440,
+        24,
+        "Пунктуация в диктовке (локальная модель)",
+    );
+    let polish_hint = child(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        WS_CHILD | WS_VISIBLE,
+        209,
+        40,
+        394,
+        420,
+        18,
+        "Ставит точки, запятые и заглавные.",
     );
     let voice_hotkey_label = child(
         hwnd,
@@ -279,7 +332,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE,
         205,
         20,
-        324,
+        420,
         440,
         20,
         "Клавиша или сочетание (одно нажатие — старт и стоп):",
@@ -291,7 +344,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_READONLY as u32),
         IDC_VOICE_HOTKEY,
         20,
-        348,
+        444,
         280,
         26,
         &keys::combo_name(settings.voice_hotkey_vk, settings.voice_hotkey_mods),
@@ -303,7 +356,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         IDC_VOICE_ASSIGN,
         310,
-        346,
+        442,
         140,
         28,
         "Назначить",
@@ -315,7 +368,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE,
         206,
         20,
-        388,
+        484,
         440,
         20,
         "Микрофон:",
@@ -327,7 +380,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
         IDC_MIC,
         20,
-        412,
+        508,
         430,
         200,
         "",
@@ -339,7 +392,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         IDC_MIC_TEST,
         20,
-        450,
+        546,
         140,
         28,
         "Проверить",
@@ -351,7 +404,7 @@ fn create_controls(
             PCWSTR::null(),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(PBS_SMOOTH),
             170,
-            454,
+            550,
             280,
             20,
             hwnd,
@@ -361,6 +414,19 @@ fn create_controls(
         )
         .unwrap_or_default()
     };
+    let version_text = format!("Версия {}", crate::VERSION);
+    let version = child(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        WS_CHILD | WS_VISIBLE,
+        207,
+        20,
+        612,
+        210,
+        20,
+        &version_text,
+    );
     let save = child(
         hwnd,
         instance,
@@ -368,7 +434,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         IDC_SAVE,
         250,
-        510,
+        606,
         110,
         30,
         "Сохранить",
@@ -380,7 +446,7 @@ fn create_controls(
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         IDC_CANCEL,
         370,
-        510,
+        606,
         80,
         30,
         "Отмена",
@@ -392,6 +458,8 @@ fn create_controls(
             enabled,
             autostart,
             switch_layout,
+            smart_layout,
+            smart_hint,
             hotkey_label,
             hotkey,
             assign,
@@ -400,12 +468,15 @@ fn create_controls(
             sep,
             voice_title,
             voice_enabled,
+            voice_polish,
+            polish_hint,
             voice_hotkey_label,
             voice_hotkey,
             voice_assign,
             mic_label,
             mic,
             mic_test,
+            version,
             save,
             cancel,
         ] {
@@ -416,15 +487,19 @@ fn create_controls(
         set_check(enabled, settings.enabled);
         set_check(autostart, settings.start_with_windows);
         set_check(switch_layout, settings.switch_layout_after);
+        set_check(smart_layout, settings.smart_layout);
         set_check(voice_enabled, settings.voice_enabled);
+        set_check(voice_polish, settings.voice_polish);
         let boxed = Box::new(Handles {
             enabled,
             autostart,
             switch_layout,
+            smart_layout,
             hotkey,
             assign,
             interval,
             voice_enabled,
+            voice_polish,
             voice_hotkey,
             voice_assign,
             mic,
@@ -532,10 +607,12 @@ pub fn fill(hwnd: HWND, settings: &Settings) {
     set_check(h.enabled, settings.enabled);
     set_check(h.autostart, settings.start_with_windows);
     set_check(h.switch_layout, settings.switch_layout_after);
+    set_check(h.smart_layout, settings.smart_layout);
     set_text(h.hotkey, &keys::display_name(settings.hotkey_vk));
     set_text(h.interval, &settings.double_tap_ms.to_string());
     set_text(h.assign, "Назначить");
     set_check(h.voice_enabled, settings.voice_enabled);
+    set_check(h.voice_polish, settings.voice_polish);
     set_text(
         h.voice_hotkey,
         &keys::combo_name(settings.voice_hotkey_vk, settings.voice_hotkey_mods),
@@ -568,6 +645,10 @@ pub fn begin_voice_capture(hwnd: HWND) {
     let Some(h) = handles_of(hwnd) else { return };
     set_text(h.voice_hotkey, "Нажмите клавишу или сочетание…");
     set_text(h.voice_assign, "Жду…");
+}
+
+pub fn refresh_microphones(hwnd: HWND, selected: &str) {
+    populate_mics(hwnd, selected);
 }
 
 pub fn selected_microphone(hwnd: HWND) -> String {
@@ -604,8 +685,10 @@ pub fn collect(hwnd: HWND, current: &Settings) -> Settings {
     next.enabled = is_checked(h.enabled);
     next.start_with_windows = is_checked(h.autostart);
     next.switch_layout_after = is_checked(h.switch_layout);
+    next.smart_layout = is_checked(h.smart_layout);
     next.double_tap_ms = read_number(h.interval).unwrap_or(current.double_tap_ms);
     next.voice_enabled = is_checked(h.voice_enabled);
+    next.voice_polish = is_checked(h.voice_polish);
     next.microphone_id = selected_microphone(hwnd);
     next.sanitize();
     next

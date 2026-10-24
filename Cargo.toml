@@ -1,6 +1,6 @@
 [package]
 name = "lswi"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Смена раскладки выделенного текста по двойному нажатию горячей клавиши"
 authors = ["LSWI"]
@@ -13,8 +13,12 @@ dirs = "6"
 [target.'cfg(windows)'.dependencies]
 cpal = "0.15"
 libloading = "0.8"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-31"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+    "implement",
     "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

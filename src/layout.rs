@@ -51,6 +51,13 @@ fn pair_map(from: &str, to: &str, ch: char) -> char {
         .unwrap_or(ch)
 }
 
+/// QWERTY punctuation that types a letter on ЙЦУКЕН (`,` → `б`, `.` → `ю`, …).
+pub fn is_layout_letter_punct(ch: char) -> bool {
+    EN.chars()
+        .zip(RU.chars())
+        .any(|(en, ru)| en == ch && ru.is_alphabetic())
+}
+
 fn change_score(original: &str, converted: &str) -> i32 {
     original
         .chars()
@@ -206,6 +213,15 @@ mod win {
 pub use win::{activate_layout, convert_selection, foreground_layout, installed_layouts};
 
 #[cfg(windows)]
+pub fn layout_for_text(
+    text: &str,
+    current: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    layouts: &[windows::Win32::UI::Input::KeyboardAndMouse::HKL],
+) -> windows::Win32::UI::Input::KeyboardAndMouse::HKL {
+    target_for_text(text, current, layouts)
+}
+
+#[cfg(windows)]
 fn target_for_text(
     text: &str,
     current: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
@@ -252,7 +268,19 @@ mod tests {
         assert_eq!(toggle_en_ru("ghbdtn"), "привет");
         assert_eq!(toggle_en_ru("привет"), "ghbdtn");
         assert_eq!(toggle_en_ru("Ghbdtn"), "Привет");
+        assert_eq!(toggle_en_ru("cdj,jlf"), "свобода");
         assert_eq!(convert_text("ghbdtn").as_deref(), Some("привет"));
         assert_eq!(convert_text("123"), None);
+    }
+
+    #[test]
+    fn qwerty_punct_that_types_russian_letters() {
+        use super::is_layout_letter_punct;
+        for ch in [',', '.', ';', '\'', '[', ']', '`'] {
+            assert!(is_layout_letter_punct(ch), "{ch}");
+        }
+        for ch in ['/', '?', '-', '!', ' '] {
+            assert!(!is_layout_letter_punct(ch), "{ch}");
+        }
     }
 }

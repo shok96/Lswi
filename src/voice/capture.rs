@@ -4,10 +4,13 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::Mutex;
+use windows::core::{implement, Result as WinResult, PCWSTR};
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::Audio::{
-    eCapture, DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+    eCapture, eConsole, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IMMDevice,
+    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -15,6 +18,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 pub struct Microphone {
     pub id: String,
@@ -129,7 +133,11 @@ pub fn start_stream(
     let format = config.sample_format();
     let stream_config = config.config();
 
-    let err_fn = |err| eprintln!("LSWI: ошибка микрофона: {err}");
+    let err_fn = move |err| {
+        eprintln!("LSWI: ошибка микрофона: {err}");
+        stop.store(true, Ordering::SeqCst);
+        super::on_capture_error();
+    };
     let stream = match format {
         SampleFormat::F32 => build::<f32>(&device, &stream_config, channels, tx, level, stop, err_fn)?,
         SampleFormat::I16 => build::<i16>(&device, &stream_config, channels, tx, level, stop, err_fn)?,
@@ -277,4 +285,112 @@ pub fn resample_to_16k(input: &[f32], from_rate: u32, acc: &mut f32) -> Vec<i16>
     }
     *acc = pos - input.len() as f32;
     out
+}
+
+struct Watch {
+    enumerator: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+}
+
+unsafe impl Send for Watch {}
+unsafe impl Sync for Watch {}
+
+static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+static LAST_DEFAULT: Mutex<String> = Mutex::new(String::new());
+
+#[implement(IMMNotificationClient)]
+struct NotificationClient;
+
+impl IMMNotificationClient_Impl for NotificationClient_Impl {
+    fn OnDeviceStateChanged(&self, _id: &PCWSTR, _state: DEVICE_STATE) -> WinResult<()> {
+        super::notify_device_change();
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _id: &PCWSTR) -> WinResult<()> {
+        super::notify_device_change();
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _id: &PCWSTR) -> WinResult<()> {
+        super::notify_device_change();
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, _role: ERole, _id: &PCWSTR) -> WinResult<()> {
+        if flow == eCapture {
+            super::notify_device_change();
+        }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(&self, _id: &PCWSTR, _key: &PROPERTYKEY) -> WinResult<()> {
+        Ok(())
+    }
+}
+
+pub fn start_watch() {
+    ensure_com();
+    stop_watch();
+    snapshot_default();
+    unsafe {
+        let Ok(enumerator) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        let client: IMMNotificationClient = NotificationClient.into();
+        if enumerator
+            .RegisterEndpointNotificationCallback(&client)
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(mut guard) = WATCH.lock() {
+            *guard = Some(Watch { enumerator, client });
+        }
+    }
+}
+
+pub fn stop_watch() {
+    if let Ok(mut guard) = WATCH.lock() {
+        if let Some(watch) = guard.take() {
+            unsafe {
+                let _ = watch
+                    .enumerator
+                    .UnregisterEndpointNotificationCallback(&watch.client);
+            }
+        }
+    }
+}
+
+pub fn default_changed() -> bool {
+    let now = default_capture_id().unwrap_or_default();
+    let Ok(mut last) = LAST_DEFAULT.lock() else {
+        return false;
+    };
+    if *last == now {
+        return false;
+    }
+    *last = now;
+    true
+}
+
+fn snapshot_default() {
+    let now = default_capture_id().unwrap_or_default();
+    if let Ok(mut last) = LAST_DEFAULT.lock() {
+        *last = now;
+    }
+}
+
+fn default_capture_id() -> Option<String> {
+    ensure_com();
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()?;
+        device_id(&device).ok()
+    }
 }

@@ -1,10 +1,13 @@
 mod capture;
 mod download;
+mod vad;
 mod vosk;
 
 use crate::clipboard;
 use crate::util::{hwnd_from_isize, hwnd_to_isize};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -15,6 +18,7 @@ pub const WM_VOICE_SHOW: u32 = WM_APP + 20;
 pub const WM_VOICE_HIDE: u32 = WM_APP + 21;
 pub const WM_VOICE_REFRESH: u32 = WM_APP + 22;
 pub const WM_MIC_LEVEL: u32 = WM_APP + 23;
+pub const WM_MIC_DEVICES: u32 = WM_APP + 24;
 
 static HOST: AtomicIsize = AtomicIsize::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -26,7 +30,12 @@ static HOTKEY_VK: AtomicU16 = AtomicU16::new(0);
 static HOTKEY_MODS: AtomicU16 = AtomicU16::new(0);
 static LEVEL: AtomicU32 = AtomicU32::new(0);
 static DEVICE_ID: Mutex<String> = Mutex::new(String::new());
+static POLISH: AtomicBool = AtomicBool::new(true);
+static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
 static UI: Mutex<UiState> = Mutex::new(UiState::new());
+static LAST_USED_MS: AtomicU64 = AtomicU64::new(0);
+static IDLE_WATCH: OnceLock<()> = OnceLock::new();
+const IDLE_MS: u64 = 3 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct UiState {
@@ -49,12 +58,44 @@ pub use capture::list_microphones;
 
 pub fn set_host(hwnd: HWND) {
     HOST.store(hwnd_to_isize(hwnd), Ordering::SeqCst);
+    IDLE_WATCH.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("lswi-model-idle".into())
+            .spawn(idle_models)
+            .ok();
+    });
 }
 
-pub fn apply_settings(enabled: bool, vk: u16, mods: u16, microphone_id: &str) {
+pub fn start_watch() {
+    capture::start_watch();
+}
+
+pub fn stop_watch() {
+    capture::stop_watch();
+}
+
+pub fn default_capture_changed() -> bool {
+    capture::default_changed()
+}
+
+pub fn meter_running() -> bool {
+    METER.load(Ordering::SeqCst)
+}
+
+pub(super) fn on_capture_error() {
+    DEVICE_LOST.store(true, Ordering::SeqCst);
+    notify_device_change();
+}
+
+pub(super) fn notify_device_change() {
+    post(WM_MIC_DEVICES, 0, 0);
+}
+
+pub fn apply_settings(enabled: bool, vk: u16, mods: u16, microphone_id: &str, polish: bool) {
     ENABLED.store(enabled, Ordering::SeqCst);
     HOTKEY_VK.store(vk, Ordering::SeqCst);
     HOTKEY_MODS.store(mods, Ordering::SeqCst);
+    POLISH.store(polish, Ordering::SeqCst);
     if let Ok(mut id) = DEVICE_ID.lock() {
         *id = microphone_id.to_string();
     }
@@ -159,6 +200,16 @@ fn run_session(device_id: &str) {
         }
     };
 
+    let _ = vad::ensure(&mut |msg| {
+        if msg == last_status {
+            return;
+        }
+        last_status = msg.to_string();
+        set_ui(msg, "", false);
+        post(WM_VOICE_REFRESH, 0, 0);
+    });
+    touch_models();
+
     set_ui("Загрузка русской модели…", "", false);
     post(WM_VOICE_REFRESH, 0, 0);
     if let Err(err) = vosk::load(&assets.dll, &assets.model) {
@@ -178,7 +229,19 @@ fn run_session(device_id: &str) {
         }
     };
 
-    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(6);
+    if POLISH.load(Ordering::SeqCst) {
+        let _ = crate::smart::ensure_model(&mut |msg| {
+            if msg == last_status {
+                return;
+            }
+            last_status = msg.to_string();
+            set_ui(msg, "", false);
+            post(WM_VOICE_REFRESH, 0, 0);
+        });
+    }
+
+    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(48);
+    DEVICE_LOST.store(false, Ordering::SeqCst);
     let stream = match capture::start_stream(device_id, tx, &LEVEL, &STOP) {
         Ok((stream, rate)) => {
             set_ui("Говорите…", "", false);
@@ -186,6 +249,11 @@ fn run_session(device_id: &str) {
             clipboard::wait_modifiers_up();
             run_recognize(recognizer, rx, rate);
             drop(stream);
+            if DEVICE_LOST.swap(false, Ordering::SeqCst) {
+                set_ui("Микрофон отключён", "", true);
+                post(WM_VOICE_REFRESH, 0, 0);
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
         Err(err) => {
             set_ui(&err, "", true);
@@ -199,6 +267,7 @@ fn run_session(device_id: &str) {
 fn run_recognize(recognizer: vosk::Recognizer, rx: mpsc::Receiver<Vec<f32>>, rate: u32) {
     let mut acc = 0.0f32;
     let mut injector = Injector::new();
+    let mut gate = vad::Gate::open();
     while !STOP.load(Ordering::SeqCst) {
         let Ok(chunk) = rx.recv_timeout(Duration::from_millis(80)) else {
             continue;
@@ -207,7 +276,14 @@ fn run_recognize(recognizer: vosk::Recognizer, rx: mpsc::Receiver<Vec<f32>>, rat
         if pcm.is_empty() {
             continue;
         }
-        match recognizer.accept(&pcm) {
+        let voiced = match gate.as_mut() {
+            Some(gate) => gate.push(&pcm),
+            None => pcm,
+        };
+        if voiced.is_empty() {
+            continue;
+        }
+        match recognizer.accept(&voiced) {
             Ok(true) => {
                 if let Ok(text) = recognizer.result_text() {
                     injector.commit(&text);
@@ -225,9 +301,18 @@ fn run_recognize(recognizer: vosk::Recognizer, rx: mpsc::Receiver<Vec<f32>>, rat
             }
         }
     }
+    if let Some(gate) = gate.as_mut() {
+        let tail = gate.finish();
+        if !tail.is_empty() {
+            let _ = recognizer.accept(&tail);
+        }
+    }
     if let Ok(text) = recognizer.final_text() {
         injector.commit(&text);
     }
+    drop(recognizer);
+    injector.finish();
+    touch_models();
 }
 
 fn run_meter(device_id: &str) {
@@ -252,6 +337,35 @@ fn run_meter(device_id: &str) {
     post(WM_MIC_LEVEL, 0, 0);
 }
 
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn touch_models() {
+    LAST_USED_MS.store(now_ms(), Ordering::SeqCst);
+}
+
+fn idle_models() {
+    loop {
+        std::thread::sleep(Duration::from_secs(30));
+        if ACTIVE.load(Ordering::SeqCst) {
+            continue;
+        }
+        let last = LAST_USED_MS.load(Ordering::SeqCst);
+        if last == 0 || now_ms().saturating_sub(last) < IDLE_MS {
+            continue;
+        }
+        LAST_USED_MS.store(0, Ordering::SeqCst);
+        vosk::unload();
+        vad::release();
+        crate::smart::release_model();
+    }
+}
+
 fn set_ui(status: &str, partial: &str, error: bool) {
     if let Ok(mut ui) = UI.lock() {
         ui.status = status.to_string();
@@ -271,23 +385,27 @@ fn post(msg: u32, wparam: usize, lparam: isize) {
 }
 
 struct Injector {
+    spoken: String,
+    typed: String,
     tail: String,
+    last_raw: String,
     started: bool,
-    last: String,
 }
 
 impl Injector {
     fn new() -> Self {
         Self {
+            spoken: String::new(),
+            typed: String::new(),
             tail: String::new(),
+            last_raw: String::new(),
             started: false,
-            last: String::new(),
         }
     }
 
     fn preview(&mut self, text: &str) {
         let next = normalize(text);
-        if next == self.tail || next == self.last {
+        if next.is_empty() || next == self.last_raw || next == self.tail {
             return;
         }
         sync(&self.tail, &next);
@@ -297,8 +415,8 @@ impl Injector {
     }
 
     fn commit(&mut self, text: &str) {
-        let mut next = normalize(text);
-        if next.is_empty() {
+        let piece = normalize(text);
+        if piece.is_empty() {
             if !self.tail.is_empty() {
                 sync(&self.tail, "");
                 self.tail.clear();
@@ -307,19 +425,116 @@ impl Injector {
             }
             return;
         }
-        if !self.started {
-            next = capitalize(&next);
-            self.started = true;
+        if piece == self.last_raw {
+            return;
         }
-        if !next.ends_with(' ') {
-            next.push(' ');
+        if !self.tail.is_empty() {
+            sync(&self.tail, "");
+            self.tail.clear();
         }
-        sync(&self.tail, &next);
-        self.last = next.trim().to_string();
-        self.tail.clear();
-        set_ui("Говорите…", next.trim(), false);
+        let expanded = apply_commands(&piece);
+        if !self.spoken.is_empty() && !self.spoken.ends_with([' ', '\n']) {
+            self.spoken.push(' ');
+        }
+        self.spoken.push_str(&expanded);
+        self.last_raw = piece;
+        let next = if POLISH.load(Ordering::SeqCst) && crate::smart::model_ready() {
+            let mut polished = punctuate_stream(&self.spoken);
+            if !polished.ends_with(' ') && !polished.ends_with('\n') {
+                polished.push(' ');
+            }
+            polished
+        } else {
+            let mut plain = expanded;
+            if !self.started {
+                plain = capitalize(&plain);
+            }
+            if !plain.ends_with(' ') && !plain.ends_with('\n') {
+                plain.push(' ');
+            }
+            if self.typed.is_empty() {
+                plain
+            } else {
+                let mut combined = self.typed.clone();
+                if !combined.ends_with([' ', '\n']) {
+                    combined.push(' ');
+                }
+                combined.push_str(plain.trim_start());
+                combined
+            }
+        };
+        self.started = true;
+        sync(&self.typed, &next);
+        self.typed = next;
+        set_ui("Говорите…", self.typed.trim(), false);
         post(WM_VOICE_REFRESH, 0, 0);
     }
+
+    fn finish(&mut self) {
+        if !self.tail.is_empty() {
+            sync(&self.tail, "");
+            self.tail.clear();
+        }
+        if !POLISH.load(Ordering::SeqCst) {
+            return;
+        }
+        let raw = self.spoken.trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        if !crate::smart::model_ready() {
+            set_ui("Загружаю модель знаков…", "", false);
+            post(WM_VOICE_REFRESH, 0, 0);
+            let _ = crate::smart::ensure_model(&mut |msg| {
+                set_ui(msg, "", false);
+                post(WM_VOICE_REFRESH, 0, 0);
+            });
+        }
+        let polished = punctuate_stream(&raw);
+        if polished.trim() == self.typed.trim() {
+            return;
+        }
+        sync(&self.typed, &polished);
+        self.typed = polished;
+        set_ui("Готово", self.typed.trim(), false);
+        post(WM_VOICE_REFRESH, 0, 0);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn punctuate_stream(raw: &str) -> String {
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    const WINDOW: usize = 60;
+    if words.len() <= WINDOW {
+        return crate::smart::polish_voice_ex(&words.join(" "), true);
+    }
+    let mut out = String::new();
+    for chunk in words.chunks(WINDOW) {
+        let part = crate::smart::polish_voice_ex(&chunk.join(" "), true);
+        if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(part.trim());
+    }
+    out
+}
+
+fn apply_commands(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| match w.to_lowercase().as_str() {
+            "точка" | "dot" => ".".to_string(),
+            "запятая" | "comma" => ",".to_string(),
+            "вопрос" | "вопросительный" => "?".to_string(),
+            "восклицание" | "восклицательный" => "!".to_string(),
+            "тире" => "—".to_string(),
+            "newline" | "enter" => "\n".to_string(),
+            _ => w.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn normalize(text: &str) -> String {

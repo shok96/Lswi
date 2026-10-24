@@ -1,10 +1,17 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod autostart;
 mod keys;
 mod layout;
 mod settings;
+mod smart;
 
+#[cfg(windows)]
+mod fetch;
+#[cfg(windows)]
+mod onnx;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]

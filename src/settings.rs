@@ -35,6 +35,12 @@ pub struct Settings {
     /// Имя устройства записи. Пустая строка — системный микрофон по умолчанию.
     #[serde(default)]
     pub microphone_id: String,
+    /// Менять раскладку по словам со словарём, а не всю строку целиком.
+    #[serde(default = "default_true")]
+    pub smart_layout: bool,
+    /// Расставлять пунктуацию и регистр после голосового ввода.
+    #[serde(default = "default_true")]
+    pub voice_polish: bool,
 }
 
 fn default_true() -> bool {
@@ -69,6 +75,8 @@ impl Default for Settings {
             voice_hotkey_vk: default_voice_hotkey(),
             voice_hotkey_mods: 0,
             microphone_id: String::new(),
+            smart_layout: true,
+            voice_polish: true,
         }
     }
 }

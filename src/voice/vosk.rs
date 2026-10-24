@@ -21,6 +21,7 @@ struct Api {
     rec_result: RecStr,
     rec_partial: RecStr,
     rec_final: RecStr,
+    model_free: ModelFree,
 }
 
 unsafe impl Send for Api {}
@@ -80,9 +81,20 @@ pub fn load(dll: &Path, model_dir: &Path) -> Result<(), String> {
         rec_result,
         rec_partial,
         rec_final,
+        model_free,
     });
-    let _ = (model_free, model_new);
+    let _ = model_new;
     Ok(())
+}
+
+pub fn unload() {
+    let Ok(mut guard) = API.lock() else {
+        return;
+    };
+    let Some(api) = guard.take() else {
+        return;
+    };
+    unsafe { (api.model_free)(api.model) };
 }
 
 pub fn recognizer(sample_rate: f32) -> Result<Recognizer, String> {
@@ -91,6 +103,13 @@ pub fn recognizer(sample_rate: f32) -> Result<Recognizer, String> {
     let ptr = unsafe { (api.rec_new)(api.model, sample_rate) };
     if ptr.is_null() {
         return Err("Не удалось создать распознаватель".into());
+    }
+    type SetDelays = unsafe extern "C" fn(*mut std::ffi::c_void, f32, f32, f32);
+    if let Ok(set_delays) = unsafe {
+        api._lib
+            .get::<SetDelays>(b"vosk_recognizer_set_endpointer_delays\0")
+    } {
+        unsafe { set_delays(ptr, 8.0, 0.8, 20.0) };
     }
     Ok(Recognizer { ptr })
 }

@@ -5,6 +5,7 @@ mod map;
 use crate::keys;
 use crate::layout;
 use crate::settings::Settings;
+use crate::smart::{self, SmartOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tao::event::Event;
@@ -13,6 +14,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 static SWITCH_LAYOUT: AtomicBool = AtomicBool::new(false);
+static SMART_LAYOUT: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -28,7 +30,10 @@ struct Ui {
     enabled_item: CheckMenuItem,
     autostart_item: CheckMenuItem,
     switch_item: CheckMenuItem,
+    smart_item: CheckMenuItem,
     assign_item: MenuItem,
+    #[allow(dead_code)]
+    version_item: MenuItem,
     quit_item: MenuItem,
     interval_items: Vec<(u32, CheckMenuItem)>,
     settings: Settings,
@@ -112,6 +117,7 @@ fn apply_runtime(settings: &Settings) {
     listen::HOTKEY_VK.store(settings.hotkey_vk, Ordering::SeqCst);
     listen::INTERVAL_MS.store(settings.double_tap_ms, Ordering::SeqCst);
     SWITCH_LAYOUT.store(settings.switch_layout_after, Ordering::SeqCst);
+    SMART_LAYOUT.store(settings.smart_layout, Ordering::SeqCst);
 }
 
 fn save_settings(ui: &mut Ui) {
@@ -135,6 +141,11 @@ fn handle_menu(ui: &mut Ui, event: MenuEvent, control_flow: &mut ControlFlow) {
     }
     if event.id == *ui.switch_item.id() {
         ui.settings.switch_layout_after = ui.switch_item.is_checked();
+        save_settings(ui);
+        return;
+    }
+    if event.id == *ui.smart_item.id() {
+        ui.settings.smart_layout = ui.smart_item.is_checked();
         save_settings(ui);
         return;
     }
@@ -191,7 +202,20 @@ fn build_ui(settings: &Settings) -> Result<Ui, Box<dyn std::error::Error>> {
         settings.switch_layout_after,
         None,
     );
+    let smart_item = CheckMenuItem::with_id(
+        "smart",
+        "Умная конвертация по словам",
+        true,
+        settings.smart_layout,
+        None,
+    );
     let assign_item = MenuItem::with_id("assign", assign_label(settings), true, None);
+    let version_item = MenuItem::with_id(
+        "version",
+        format!("Версия {}", crate::VERSION),
+        false,
+        None,
+    );
     let quit_item = MenuItem::with_id("quit", "Выход", true, None);
 
     let presets = [250_u32, 400, 600, 800, 1000];
@@ -218,10 +242,12 @@ fn build_ui(settings: &Settings) -> Result<Ui, Box<dyn std::error::Error>> {
     menu.append(&enabled_item)?;
     menu.append(&autostart_item)?;
     menu.append(&switch_item)?;
+    menu.append(&smart_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&assign_item)?;
     menu.append(&interval_menu)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&version_item)?;
     menu.append(&quit_item)?;
 
     let tray = TrayIconBuilder::new()
@@ -235,7 +261,9 @@ fn build_ui(settings: &Settings) -> Result<Ui, Box<dyn std::error::Error>> {
         enabled_item,
         autostart_item,
         switch_item,
+        smart_item,
         assign_item,
+        version_item,
         quit_item,
         interval_items,
         settings: settings.clone(),
@@ -267,7 +295,16 @@ fn convert_now() {
     }
     let previous = clipboard::snapshot();
     std::thread::sleep(Duration::from_millis(40));
-    let converted = clipboard::copy_selection().and_then(|text| layout::convert_text(&text));
+    let converted = clipboard::copy_selection().and_then(|text| {
+        if SMART_LAYOUT.load(Ordering::SeqCst) && smart::dict_ready() {
+            match smart::convert_outcome(&text) {
+                SmartOutcome::Converted(s) => Some(s),
+                SmartOutcome::Unchanged | SmartOutcome::Uncertain => None,
+            }
+        } else {
+            layout::convert_text(&text)
+        }
+    });
     if let Some(converted) = converted {
         let _ = clipboard::paste_text(&converted);
         if SWITCH_LAYOUT.load(Ordering::SeqCst) {
